@@ -33,6 +33,16 @@ on:
         required: false
         default: ''
         type: string
+      worker_threads:
+        description: Parallel aggregation workers. Use 3 for moderate CPU, 1 for serial mode.
+        required: false
+        default: '3'
+        type: string
+      batch_rows:
+        description: Rows per worker batch before the next trainer boundary.
+        required: false
+        default: '100000'
+        type: string
       run_statistics_now:
         description: Run the statistics export immediately after deploying the Docker image.
         required: true
@@ -68,6 +78,8 @@ jobs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       limit: ${{ steps.plan.outputs.limit }}
       run_statistics_now: ${{ steps.plan.outputs.run_statistics_now }}
+      worker_threads: ${{ steps.plan.outputs.worker_threads }}
+      batch_rows: ${{ steps.plan.outputs.batch_rows }}
 
     steps:
       - name: Checkout
@@ -82,11 +94,27 @@ jobs:
           deploy_target="${{ github.event.inputs.deploy_target || 'both' }}"
           dataset_version="${{ github.event.inputs.dataset_version || '' }}"
           limit="${{ github.event.inputs.limit || '' }}"
+          worker_threads="${{ github.event.inputs.worker_threads || '3' }}"
+          batch_rows="${{ github.event.inputs.batch_rows || '100000' }}"
           run_statistics_now="${{ github.event.inputs.run_statistics_now || 'true' }}"
+
+          validate_positive_int() {
+            local name="$1"
+            local value="$2"
+            if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+              echo "$name must be a positive integer, got: $value" >&2
+              exit 1
+            fi
+          }
+
+          validate_positive_int worker_threads "$worker_threads"
+          validate_positive_int batch_rows "$batch_rows"
 
           echo "deploy_target=$deploy_target" >> "$GITHUB_OUTPUT"
           echo "dataset_version=$dataset_version" >> "$GITHUB_OUTPUT"
           echo "limit=$limit" >> "$GITHUB_OUTPUT"
+          echo "worker_threads=$worker_threads" >> "$GITHUB_OUTPUT"
+          echo "batch_rows=$batch_rows" >> "$GITHUB_OUTPUT"
           echo "run_statistics_now=$run_statistics_now" >> "$GITHUB_OUTPUT"
 
       - name: Set image metadata
@@ -203,6 +231,8 @@ jobs:
           DEPLOY_TARGET: ${{ needs.build.outputs.deploy_target }}
           DATASET_VERSION: ${{ needs.build.outputs.dataset_version }}
           LIMIT: ${{ needs.build.outputs.limit }}
+          WORKER_THREADS: ${{ needs.build.outputs.worker_threads }}
+          BATCH_ROWS: ${{ needs.build.outputs.batch_rows }}
           RUN_STATISTICS_NOW: ${{ needs.build.outputs.run_statistics_now }}
         run: |
           set -euo pipefail
@@ -214,6 +244,8 @@ jobs:
             "DEPLOY_TARGET=$(printf '%q' "$DEPLOY_TARGET")"
             "DATASET_VERSION=$(printf '%q' "$DATASET_VERSION")"
             "LIMIT=$(printf '%q' "$LIMIT")"
+            "WORKER_THREADS=$(printf '%q' "$WORKER_THREADS")"
+            "BATCH_ROWS=$(printf '%q' "$BATCH_ROWS")"
             "RUN_STATISTICS_NOW=$(printf '%q' "$RUN_STATISTICS_NOW")"
             "ENV_FILE=$(printf '%q' "$ENV_FILE")"
             "PROD_FRONTEND_ROOT=$(printf '%q' "$PROD_FRONTEND_ROOT")"
@@ -232,6 +264,8 @@ jobs:
           deploy_target="$DEPLOY_TARGET"
           dataset_version="${DATASET_VERSION:-}"
           limit="${LIMIT:-}"
+          worker_threads="${WORKER_THREADS:-3}"
+          batch_rows="${BATCH_ROWS:-100000}"
           run_statistics_now="${RUN_STATISTICS_NOW:-true}"
           env_file="$ENV_FILE"
           prod_frontend_root="$PROD_FRONTEND_ROOT"
@@ -279,6 +313,8 @@ jobs:
             --env-file "$env_file"
             -e "UMAMOE_TARGET_ROOTS=$target_roots"
             -e "UMAMOE_STATISTICS_RELATIVE_DIR=$statistics_relative_dir"
+            -e "UMAMOE_WORKER_THREADS=$worker_threads"
+            -e "UMAMOE_BATCH_ROWS=$batch_rows"
           )
 
           if [ -n "$dataset_version" ]; then

@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::Hash;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{get_current_pid, Pid, System};
 
@@ -46,6 +49,12 @@ struct Args {
 
     #[arg(long)]
     resource_usage: bool,
+
+    #[arg(long)]
+    worker_threads: Option<usize>,
+
+    #[arg(long, default_value_t = 100_000)]
+    batch_rows: usize,
 }
 
 #[derive(Clone)]
@@ -223,6 +232,23 @@ impl StatAccumulator {
         *self.values.entry(value).or_insert(0) += 1;
     }
 
+    fn merge(&mut self, other: Self) {
+        self.count += other.count;
+        self.sum += other.sum;
+        self.sum_sq += other.sum_sq;
+        self.min = match (self.min, other.min) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        self.max = match (self.max, other.max) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        merge_count_map(&mut self.values, other.values);
+    }
+
     fn full_json(&self, stat_name: &str) -> Value {
         if self.count == 0 {
             return Value::Object(Map::new());
@@ -332,6 +358,15 @@ struct ItemLevelCounts {
     levels: [u64; 10],
 }
 
+impl ItemLevelCounts {
+    fn merge(&mut self, other: Self) {
+        self.total += other.total;
+        for (target, source) in self.levels.iter_mut().zip(other.levels) {
+            *target += source;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ReportAgg {
     entries: u64,
@@ -387,6 +422,24 @@ impl ReportAgg {
         if let Some(deck_id) = prepared.support_deck_id {
             self.combo_total += 1;
             *self.combo_counts.entry(deck_id).or_insert(0) += 1;
+        }
+    }
+
+    fn merge(&mut self, other: Self, deck_id_map: &[u32]) {
+        self.entries += other.entries;
+        for (target, source) in self.stats.iter_mut().zip(other.stats) {
+            target.merge(source);
+        }
+        merge_count_map(&mut self.uma_counts, other.uma_counts);
+        merge_item_level_map(&mut self.support_items, other.support_items);
+        merge_item_level_map(&mut self.skill_items, other.skill_items);
+        self.support_count += other.support_count;
+        self.skill_count += other.skill_count;
+        self.combo_total += other.combo_total;
+
+        for (old_deck_id, count) in other.combo_counts {
+            let new_deck_id = deck_id_map[old_deck_id as usize];
+            *self.combo_counts.entry(new_deck_id).or_insert(0) += count;
         }
     }
 
@@ -452,6 +505,19 @@ struct DistanceAgg {
     by_scenario: HashMap<u8, ReportAgg>,
 }
 
+impl DistanceAgg {
+    fn merge(&mut self, other: Self, deck_id_map: &[u32]) {
+        self.total_entries += other.total_entries;
+        merge_report_map(&mut self.by_team_class, other.by_team_class, deck_id_map);
+        merge_report_map(
+            &mut self.by_team_class_scenario,
+            other.by_team_class_scenario,
+            deck_id_map,
+        );
+        merge_report_map(&mut self.by_scenario, other.by_scenario, deck_id_map);
+    }
+}
+
 #[derive(Default)]
 struct CharacterAgg {
     overall: ReportAgg,
@@ -466,12 +532,50 @@ struct CharacterAgg {
     team_class_trainers: HashMap<u8, u64>,
 }
 
+impl CharacterAgg {
+    fn merge(&mut self, other: Self, deck_id_map: &[u32]) {
+        self.overall.merge(other.overall, deck_id_map);
+        merge_report_map(&mut self.by_scenario, other.by_scenario, deck_id_map);
+        merge_report_map(
+            &mut self.by_distance_class,
+            other.by_distance_class,
+            deck_id_map,
+        );
+        merge_report_map(
+            &mut self.by_distance_class_scenario,
+            other.by_distance_class_scenario,
+            deck_id_map,
+        );
+        merge_count_map(&mut self.distance_counts, other.distance_counts);
+        merge_count_map(&mut self.running_style_counts, other.running_style_counts);
+        merge_count_map(&mut self.scenario_counts, other.scenario_counts);
+        merge_count_map(&mut self.team_class_rows, other.team_class_rows);
+        self.total_trainers += other.total_trainers;
+        merge_count_map(&mut self.team_class_trainers, other.team_class_trainers);
+    }
+}
+
 #[derive(Default)]
 struct TrainerCounts {
     total_trainers: u64,
     class_trainers: HashMap<u8, u64>,
     scenario_total_trainers: HashMap<u8, u64>,
     scenario_class_trainers: HashMap<(u8, u8), u64>,
+}
+
+impl TrainerCounts {
+    fn merge(&mut self, other: Self) {
+        self.total_trainers += other.total_trainers;
+        merge_count_map(&mut self.class_trainers, other.class_trainers);
+        merge_count_map(
+            &mut self.scenario_total_trainers,
+            other.scenario_total_trainers,
+        );
+        merge_count_map(
+            &mut self.scenario_class_trainers,
+            other.scenario_class_trainers,
+        );
+    }
 }
 
 #[derive(Default)]
@@ -508,6 +612,49 @@ impl Compiler {
             dataset_version,
             ..Self::default()
         }
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        other.finish();
+        let Compiler {
+            generated_at: _,
+            dataset_version: _,
+            dataset_name: _,
+            total_entries,
+            character_ids,
+            global,
+            by_team_class,
+            by_team_class_scenario,
+            by_scenario,
+            distances,
+            characters,
+            trainer_counts,
+            active_trainer: _,
+            support_decks,
+        } = other;
+
+        let deck_id_map = self.merge_support_decks(support_decks);
+        self.total_entries += total_entries;
+        self.character_ids.extend(character_ids);
+        self.global.merge(global, &deck_id_map);
+        merge_report_map(&mut self.by_team_class, by_team_class, &deck_id_map);
+        merge_report_map(
+            &mut self.by_team_class_scenario,
+            by_team_class_scenario,
+            &deck_id_map,
+        );
+        merge_report_map(&mut self.by_scenario, by_scenario, &deck_id_map);
+        merge_distance_map(&mut self.distances, distances, &deck_id_map);
+        merge_character_map(&mut self.characters, characters, &deck_id_map);
+        self.trainer_counts.merge(trainer_counts);
+    }
+
+    fn merge_support_decks(&mut self, support_decks: SupportDeckInterner) -> Vec<u32> {
+        support_decks
+            .keys
+            .into_iter()
+            .map(|deck_key| self.support_decks.intern(deck_key))
+            .collect()
     }
 
     fn add_row(&mut self, row: RowData) {
@@ -1238,6 +1385,12 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let worker_threads = args
+        .worker_threads
+        .unwrap_or_else(default_worker_threads)
+        .max(1);
+    let batch_rows = args.batch_rows.max(1);
+    let progress_every = args.progress_every;
     let repo_root = args.repo_root.canonicalize().unwrap_or(args.repo_root);
     let database_url = args
         .database_url
@@ -1258,7 +1411,7 @@ fn main() -> Result<()> {
     println!("Connecting to PostgreSQL...");
     let mut client = Client::connect(&database_url, NoTls).context("connect to PostgreSQL")?;
 
-    let mut compiler = Compiler::new(dataset_version);
+    let mut compiler = Compiler::new(dataset_version.clone());
     let started_at = Instant::now();
     let query = statistics_copy_query(args.limit);
     let reader = client
@@ -1269,19 +1422,28 @@ fn main() -> Result<()> {
         .from_reader(reader);
     let headers = csv_reader.headers().context("read COPY headers")?.clone();
 
-    for result in csv_reader.records() {
-        let record = result.context("read COPY row")?;
-        let row = parse_record(&headers, &record)?;
-        compiler.add_row(row);
-
-        if args.progress_every > 0 && compiler.total_entries % args.progress_every == 0 {
-            print_progress(
-                &mut resource_monitor,
-                "processed",
-                compiler.total_entries,
-                started_at.elapsed(),
-            );
-        }
+    if worker_threads > 1 {
+        println!("Using {worker_threads} worker threads with {batch_rows} row batches...");
+        stream_rows_parallel(
+            &mut csv_reader,
+            &headers,
+            &mut compiler,
+            &dataset_version,
+            worker_threads,
+            batch_rows,
+            progress_every,
+            &mut resource_monitor,
+            started_at,
+        )?;
+    } else {
+        stream_rows_serial(
+            &mut csv_reader,
+            &headers,
+            &mut compiler,
+            progress_every,
+            &mut resource_monitor,
+            started_at,
+        )?;
     }
 
     compiler.finish();
@@ -1314,6 +1476,153 @@ fn main() -> Result<()> {
         started_at.elapsed(),
     );
     Ok(())
+}
+
+fn default_worker_threads() -> usize {
+    thread::available_parallelism()
+        .map(|threads| threads.get().min(3))
+        .unwrap_or(1)
+}
+
+fn stream_rows_serial<R: Read>(
+    csv_reader: &mut csv::Reader<R>,
+    headers: &StringRecord,
+    compiler: &mut Compiler,
+    progress_every: u64,
+    resource_monitor: &mut Option<ResourceMonitor>,
+    started_at: Instant,
+) -> Result<()> {
+    for result in csv_reader.records() {
+        let record = result.context("read COPY row")?;
+        let row = parse_record(headers, &record)?;
+        compiler.add_row(row);
+
+        if progress_every > 0 && compiler.total_entries % progress_every == 0 {
+            print_progress(
+                resource_monitor,
+                "processed",
+                compiler.total_entries,
+                started_at.elapsed(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn stream_rows_parallel<R: Read>(
+    csv_reader: &mut csv::Reader<R>,
+    headers: &StringRecord,
+    compiler: &mut Compiler,
+    dataset_version: &str,
+    worker_threads: usize,
+    batch_rows: usize,
+    progress_every: u64,
+    resource_monitor: &mut Option<ResourceMonitor>,
+    started_at: Instant,
+) -> Result<()> {
+    let (batch_sender, batch_receiver) = mpsc::sync_channel::<Vec<RowData>>(worker_threads * 2);
+    let batch_receiver = Arc::new(Mutex::new(batch_receiver));
+    let (result_sender, result_receiver) = mpsc::channel::<Compiler>();
+    let mut handles = Vec::with_capacity(worker_threads);
+
+    for _ in 0..worker_threads {
+        let batch_receiver = Arc::clone(&batch_receiver);
+        let result_sender = result_sender.clone();
+        let dataset_version = dataset_version.to_string();
+        handles.push(thread::spawn(move || loop {
+            let batch = {
+                let receiver = batch_receiver.lock().expect("batch receiver lock poisoned");
+                receiver.recv()
+            };
+
+            let Ok(batch) = batch else {
+                break;
+            };
+
+            let mut partial = Compiler::new(dataset_version.clone());
+            for row in batch {
+                partial.add_row(row);
+            }
+            partial.finish();
+
+            if result_sender.send(partial).is_err() {
+                break;
+            }
+        }));
+    }
+    drop(result_sender);
+
+    let mut batch = Vec::with_capacity(batch_rows);
+    let mut current_trainer_id: Option<String> = None;
+    let mut rows_read = 0_u64;
+    let mut sent_batches = 0_usize;
+    let mut merged_batches = 0_usize;
+    let mut next_progress = progress_every;
+
+    for result in csv_reader.records() {
+        let record = result.context("read COPY row")?;
+        let row = parse_record(headers, &record)?;
+        let starts_new_trainer = current_trainer_id
+            .as_deref()
+            .map_or(false, |trainer_id| trainer_id != row.trainer_id);
+
+        if starts_new_trainer && batch.len() >= batch_rows {
+            let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(batch_rows));
+            batch_sender
+                .send(full_batch)
+                .map_err(|_| anyhow!("statistics worker stopped before receiving a batch"))?;
+            sent_batches += 1;
+            merge_available_results(&result_receiver, compiler, &mut merged_batches);
+        }
+
+        current_trainer_id = Some(row.trainer_id.clone());
+        batch.push(row);
+        rows_read += 1;
+
+        if progress_every > 0 && rows_read >= next_progress {
+            print_progress(resource_monitor, "queued", rows_read, started_at.elapsed());
+            while next_progress <= rows_read {
+                next_progress += progress_every;
+            }
+            merge_available_results(&result_receiver, compiler, &mut merged_batches);
+        }
+    }
+
+    if !batch.is_empty() {
+        batch_sender
+            .send(batch)
+            .map_err(|_| anyhow!("statistics worker stopped before receiving the final batch"))?;
+        sent_batches += 1;
+    }
+    drop(batch_sender);
+
+    while merged_batches < sent_batches {
+        let partial = result_receiver
+            .recv()
+            .context("receive worker statistics")?;
+        compiler.merge(partial);
+        merged_batches += 1;
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("statistics worker panicked"))?;
+    }
+
+    Ok(())
+}
+
+fn merge_available_results(
+    result_receiver: &mpsc::Receiver<Compiler>,
+    compiler: &mut Compiler,
+    merged_batches: &mut usize,
+) {
+    while let Ok(partial) = result_receiver.try_recv() {
+        compiler.merge(partial);
+        *merged_batches += 1;
+    }
 }
 
 fn print_progress(
@@ -1391,7 +1700,7 @@ fn prepare_row(row: &RowData, support_decks: &mut SupportDeckInterner) -> Prepar
     let support_items = row
         .support_cards
         .iter()
-        .filter_map(|raw| parse_item(*raw))
+        .filter_map(|raw| parse_support_card(*raw).map(|card_id| (card_id, 0)))
         .collect::<Vec<_>>();
     let skill_items = row
         .skills
@@ -1730,6 +2039,18 @@ fn parse_item(raw: u32) -> Option<(u32, usize)> {
     Some((raw / 10, (raw % 10) as usize))
 }
 
+fn parse_support_card(raw: u32) -> Option<u32> {
+    if raw == 0 {
+        return None;
+    }
+
+    if raw >= 1_000_000 {
+        Some(raw / 100)
+    } else {
+        Some(raw / 10)
+    }
+}
+
 fn field<'a>(headers: &StringRecord, record: &'a StringRecord, name: &str) -> Result<&'a str> {
     let index = headers
         .iter()
@@ -1771,6 +2092,62 @@ fn json_u32(value: Option<&Value>) -> Option<u32> {
         Value::Number(number) => number.as_u64().and_then(|value| u32::try_from(value).ok()),
         Value::String(text) => text.parse::<u32>().ok(),
         _ => None,
+    }
+}
+
+fn merge_count_map<K>(target: &mut HashMap<K, u64>, source: HashMap<K, u64>)
+where
+    K: Eq + Hash,
+{
+    for (key, count) in source {
+        *target.entry(key).or_insert(0) += count;
+    }
+}
+
+fn merge_item_level_map(
+    target: &mut HashMap<u32, ItemLevelCounts>,
+    source: HashMap<u32, ItemLevelCounts>,
+) {
+    for (item_id, counts) in source {
+        target.entry(item_id).or_default().merge(counts);
+    }
+}
+
+fn merge_report_map<K>(
+    target: &mut HashMap<K, ReportAgg>,
+    source: HashMap<K, ReportAgg>,
+    deck_id_map: &[u32],
+) where
+    K: Eq + Hash,
+{
+    for (key, report) in source {
+        target.entry(key).or_default().merge(report, deck_id_map);
+    }
+}
+
+fn merge_distance_map(
+    target: &mut HashMap<u8, DistanceAgg>,
+    source: HashMap<u8, DistanceAgg>,
+    deck_id_map: &[u32],
+) {
+    for (distance_id, distance) in source {
+        target
+            .entry(distance_id)
+            .or_default()
+            .merge(distance, deck_id_map);
+    }
+}
+
+fn merge_character_map(
+    target: &mut HashMap<u32, CharacterAgg>,
+    source: HashMap<u32, CharacterAgg>,
+    deck_id_map: &[u32],
+) {
+    for (character_id, character) in source {
+        target
+            .entry(character_id)
+            .or_default()
+            .merge(character, deck_id_map);
     }
 }
 
@@ -1849,5 +2226,12 @@ mod tests {
     fn unpacks_item_id_and_appended_level() {
         assert_eq!(parse_item(100024), Some((10002, 4)));
         assert_eq!(parse_item(0), None);
+    }
+
+    #[test]
+    fn strips_support_card_lb_and_level_suffixes() {
+        assert_eq!(parse_support_card(100014), Some(10001));
+        assert_eq!(parse_support_card(1000142), Some(10001));
+        assert_eq!(parse_support_card(0), None);
     }
 }

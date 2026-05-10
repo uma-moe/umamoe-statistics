@@ -23,6 +23,14 @@ if [ -n "${UMAMOE_LIMIT:-}" ]; then
   set -- "$@" --limit "$UMAMOE_LIMIT"
 fi
 
+if [ -n "${UMAMOE_WORKER_THREADS:-}" ]; then
+  set -- "$@" --worker-threads "$UMAMOE_WORKER_THREADS"
+fi
+
+if [ -n "${UMAMOE_BATCH_ROWS:-}" ]; then
+  set -- "$@" --batch-rows "$UMAMOE_BATCH_ROWS"
+fi
+
 case "${UMAMOE_RESOURCE_USAGE:-}" in
   1|true|TRUE|yes|YES)
     set -- "$@" --resource-usage
