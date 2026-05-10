@@ -33,6 +33,11 @@ on:
         required: false
         default: ''
         type: string
+      run_statistics_now:
+        description: Run the statistics export immediately after deploying the Docker image.
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -62,6 +67,7 @@ jobs:
       deploy_target: ${{ steps.plan.outputs.deploy_target }}
       image_tag: ${{ steps.meta.outputs.image_tag }}
       limit: ${{ steps.plan.outputs.limit }}
+      run_statistics_now: ${{ steps.plan.outputs.run_statistics_now }}
 
     steps:
       - name: Checkout
@@ -76,10 +82,12 @@ jobs:
           deploy_target="${{ github.event.inputs.deploy_target || 'both' }}"
           dataset_version="${{ github.event.inputs.dataset_version || '' }}"
           limit="${{ github.event.inputs.limit || '' }}"
+          run_statistics_now="${{ github.event.inputs.run_statistics_now || 'true' }}"
 
           echo "deploy_target=$deploy_target" >> "$GITHUB_OUTPUT"
           echo "dataset_version=$dataset_version" >> "$GITHUB_OUTPUT"
           echo "limit=$limit" >> "$GITHUB_OUTPUT"
+          echo "run_statistics_now=$run_statistics_now" >> "$GITHUB_OUTPUT"
 
       - name: Set image metadata
         id: meta
@@ -195,28 +203,40 @@ jobs:
           DEPLOY_TARGET: ${{ needs.build.outputs.deploy_target }}
           DATASET_VERSION: ${{ needs.build.outputs.dataset_version }}
           LIMIT: ${{ needs.build.outputs.limit }}
+          RUN_STATISTICS_NOW: ${{ needs.build.outputs.run_statistics_now }}
         run: |
           set -euo pipefail
 
           remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
+          remote_env=(
+            "ARCHIVE=$(printf '%q' "$remote_archive")"
+            "IMAGE_TAG=$(printf '%q' "$IMAGE_TAG")"
+            "DEPLOY_TARGET=$(printf '%q' "$DEPLOY_TARGET")"
+            "DATASET_VERSION=$(printf '%q' "$DATASET_VERSION")"
+            "LIMIT=$(printf '%q' "$LIMIT")"
+            "RUN_STATISTICS_NOW=$(printf '%q' "$RUN_STATISTICS_NOW")"
+            "ENV_FILE=$(printf '%q' "$ENV_FILE")"
+            "PROD_FRONTEND_ROOT=$(printf '%q' "$PROD_FRONTEND_ROOT")"
+            "BETA_FRONTEND_ROOT=$(printf '%q' "$BETA_FRONTEND_ROOT")"
+            "STATISTICS_RELATIVE_DIR=$(printf '%q' "$STATISTICS_RELATIVE_DIR")"
+          )
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
 
-          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$DEPLOY_TARGET" "$DATASET_VERSION" "$LIMIT" \
-            "$ENV_FILE" "$PROD_FRONTEND_ROOT" "$BETA_FRONTEND_ROOT" "$STATISTICS_RELATIVE_DIR" <<'REMOTE_SCRIPT'
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "${remote_env[*]} bash -s" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
-          archive="$1"
-          image_tag="$2"
-          deploy_target="$3"
-          dataset_version="$4"
-          limit="$5"
-          env_file="$6"
-          prod_frontend_root="$7"
-          beta_frontend_root="$8"
-          statistics_relative_dir="$9"
+          archive="$ARCHIVE"
+          image_tag="$IMAGE_TAG"
+          deploy_target="$DEPLOY_TARGET"
+          dataset_version="${DATASET_VERSION:-}"
+          limit="${LIMIT:-}"
+          run_statistics_now="${RUN_STATISTICS_NOW:-true}"
+          env_file="$ENV_FILE"
+          prod_frontend_root="$PROD_FRONTEND_ROOT"
+          beta_frontend_root="$BETA_FRONTEND_ROOT"
+          statistics_relative_dir="$STATISTICS_RELATIVE_DIR"
 
           case "$deploy_target" in
             beta)
@@ -234,12 +254,23 @@ jobs:
               ;;
           esac
 
+          gzip -dc "$archive" | docker load
+
+          case "$run_statistics_now" in
+            1|true|TRUE|yes|YES)
+              ;;
+            *)
+              echo "Docker image loaded. Skipping immediate statistics run because run_statistics_now=$run_statistics_now."
+              rm -f "$archive"
+              docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
+              exit 0
+              ;;
+          esac
+
           if [ ! -f "$env_file" ]; then
             echo "Missing statistics env file: $env_file" >&2
             exit 1
           fi
-
-          gzip -dc "$archive" | docker load
 
           docker_args=(
             run --rm
