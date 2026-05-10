@@ -1,0 +1,271 @@
+name: Build And Deploy Statistics
+
+on:
+  schedule:
+    # Sunday 00:00 JST. GitHub Actions cron uses UTC.
+    - cron: '0 15 * * 6'
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: Deployment target
+        required: true
+        default: both
+        type: choice
+        options:
+          - beta
+          - production
+          - both
+      dataset_version:
+        description: Optional dataset id, for example 2026-W19. Empty uses the generator default.
+        required: false
+        default: ''
+        type: string
+      limit:
+        description: Optional row limit for smoke runs. Leave empty for the full dataset.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PLATFORM: linux/amd64
+  CACHE_SCOPE: statistics-container
+  DEPLOY_USER: github
+  REMOTE_IMAGE_DIR: /tmp/umamoe-statistics-images
+  IMAGE_NAME: umamoe-statistics-generator
+  ENV_FILE: /opt/umamoe-statistics/statistics.env
+  PROD_FRONTEND_ROOT: /var/www/html/umamoe
+  BETA_FRONTEND_ROOT: /var/www/html/umamoe_beta
+  STATISTICS_RELATIVE_DIR: assets/statistics
+
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Statistics Image
+    runs-on: ubuntu-latest
+    outputs:
+      archive_name: ${{ steps.meta.outputs.archive_name }}
+      dataset_version: ${{ steps.plan.outputs.dataset_version }}
+      deploy_target: ${{ steps.plan.outputs.deploy_target }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      limit: ${{ steps.plan.outputs.limit }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Choose deployment plan
+        id: plan
+        shell: bash
+        run: |
+          deploy_target="${{ github.event.inputs.deploy_target || 'both' }}"
+          dataset_version="${{ github.event.inputs.dataset_version || '' }}"
+          limit="${{ github.event.inputs.limit || '' }}"
+
+          echo "deploy_target=$deploy_target" >> "$GITHUB_OUTPUT"
+          echo "dataset_version=$dataset_version" >> "$GITHUB_OUTPUT"
+          echo "limit=$limit" >> "$GITHUB_OUTPUT"
+
+      - name: Set image metadata
+        id: meta
+        shell: bash
+        run: |
+          image_tag="${IMAGE_NAME}:${GITHUB_SHA}"
+          archive_name="${IMAGE_NAME}-${GITHUB_SHA}.tar.gz"
+
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "archive_name=$archive_name" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build statistics image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          pull: true
+          load: true
+          tags: ${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}
+
+      - name: Save statistics image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          docker save "${{ steps.meta.outputs.image_tag }}" | gzip -1 > "${{ runner.temp }}/${{ steps.meta.outputs.archive_name }}"
+
+      - name: Upload statistics image artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: statistics-image
+          path: ${{ runner.temp }}/${{ steps.meta.outputs.archive_name }}
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy Statistics
+    if: github.event_name != 'pull_request' && contains(fromJSON('["beta", "production", "both"]'), needs.build.outputs.deploy_target)
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.build.outputs.deploy_target == 'beta' && 'beta' || 'production' }}
+
+    steps:
+      - name: Download statistics image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: statistics-image
+          path: ${{ runner.temp }}
+
+      - name: Mask deployment metadata
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          mask_value() {
+            local value="$1"
+            if [[ -n "$value" ]]; then
+              echo "::add-mask::$value"
+            fi
+          }
+
+          mask_value "$DEPLOY_HOST"
+
+          while IFS= read -r known_host_line; do
+            mask_value "$known_host_line"
+            read -r known_host _ key_body _ <<< "$known_host_line"
+            mask_value "$known_host"
+            mask_value "$key_body"
+          done <<< "$DEPLOY_KNOWN_HOSTS"
+
+      - name: Start SSH agent
+        shell: bash
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          ssh-add - <<< "$DEPLOY_SSH_KEY" >/dev/null 2>&1
+
+      - name: Configure known hosts
+        shell: bash
+        env:
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [ -z "$DEPLOY_KNOWN_HOSTS" ]; then
+            echo "DEPLOY_KNOWN_HOSTS is required for deploy host verification." >&2
+            exit 1
+          fi
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy statistics
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          ARCHIVE_NAME: ${{ needs.build.outputs.archive_name }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DEPLOY_TARGET: ${{ needs.build.outputs.deploy_target }}
+          DATASET_VERSION: ${{ needs.build.outputs.dataset_version }}
+          LIMIT: ${{ needs.build.outputs.limit }}
+        run: |
+          set -euo pipefail
+
+          remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
+
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
+            "$remote_archive" "$IMAGE_TAG" "$DEPLOY_TARGET" "$DATASET_VERSION" "$LIMIT" \
+            "$ENV_FILE" "$PROD_FRONTEND_ROOT" "$BETA_FRONTEND_ROOT" "$STATISTICS_RELATIVE_DIR" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          archive="$1"
+          image_tag="$2"
+          deploy_target="$3"
+          dataset_version="$4"
+          limit="$5"
+          env_file="$6"
+          prod_frontend_root="$7"
+          beta_frontend_root="$8"
+          statistics_relative_dir="$9"
+
+          case "$deploy_target" in
+            beta)
+              target_roots="$beta_frontend_root"
+              ;;
+            production)
+              target_roots="$prod_frontend_root"
+              ;;
+            both)
+              target_roots="$beta_frontend_root $prod_frontend_root"
+              ;;
+            *)
+              echo "Unsupported deploy target: $deploy_target" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ ! -f "$env_file" ]; then
+            echo "Missing statistics env file: $env_file" >&2
+            exit 1
+          fi
+
+          gzip -dc "$archive" | docker load
+
+          docker_args=(
+            run --rm
+            --name "umamoe-statistics-${deploy_target}"
+            --add-host host.docker.internal:host-gateway
+            --env-file "$env_file"
+            -e "UMAMOE_TARGET_ROOTS=$target_roots"
+            -e "UMAMOE_STATISTICS_RELATIVE_DIR=$statistics_relative_dir"
+          )
+
+          if [ -n "$dataset_version" ]; then
+            docker_args+=(-e "UMAMOE_DATASET_VERSION=$dataset_version")
+          fi
+
+          if [ -n "$limit" ]; then
+            docker_args+=(-e "UMAMOE_LIMIT=$limit")
+          fi
+
+          for target_root in $target_roots; do
+            mkdir -p "$target_root/$statistics_relative_dir"
+            docker_args+=(-v "$target_root:$target_root")
+          done
+
+          docker rm -f "umamoe-statistics-${deploy_target}" >/dev/null 2>&1 || true
+          docker "${docker_args[@]}" "$image_tag"
+
+          rm -f "$archive"
+          docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
+          REMOTE_SCRIPT

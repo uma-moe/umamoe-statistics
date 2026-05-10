@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"name": "src",
+			"path": "../umamoe-frontend/statistics-generator/src"
+		},
+		{
+			"name": "umamoe-statistics",
+			"path": "."
+		},
+		{
+			"name": "target",
+			"path": "../umamoe-frontend/statistics-generator/target"
+		}
+	],
+	"settings": {}
+}
