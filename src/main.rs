@@ -16,6 +16,7 @@ const STAT_NAMES: [&str; 6] = ["speed", "power", "stamina", "wiz", "guts", "rank
 const DISTANCE_IDS: [u8; 5] = [1, 2, 3, 4, 5];
 const DATA_FORMAT: &str = "ids-v1";
 const DATA_FORMAT_VERSION: u8 = 2;
+const INLINE_SUPPORT_DECK_SIZE: usize = 6;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,7 +66,85 @@ struct PreparedRow {
     skill_items: Vec<(u32, usize)>,
     support_count: u64,
     skill_count: u64,
-    support_deck_key: Option<String>,
+    support_deck_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum SupportDeckKey {
+    Inline {
+        len: u8,
+        ids: [u32; INLINE_SUPPORT_DECK_SIZE],
+    },
+    Overflow(Vec<u32>),
+}
+
+impl SupportDeckKey {
+    fn from_items(items: &[(u32, usize)]) -> Option<Self> {
+        if items.is_empty() {
+            return None;
+        }
+
+        if items.len() <= INLINE_SUPPORT_DECK_SIZE {
+            let mut ids = [0_u32; INLINE_SUPPORT_DECK_SIZE];
+            for (index, (item_id, _)) in items.iter().enumerate() {
+                ids[index] = *item_id;
+            }
+            ids[..items.len()].sort_unstable();
+            Some(Self::Inline {
+                len: items.len() as u8,
+                ids,
+            })
+        } else {
+            let mut deck_ids: Vec<u32> = items.iter().map(|(item_id, _)| *item_id).collect();
+            deck_ids.sort_unstable();
+            Some(Self::Overflow(deck_ids))
+        }
+    }
+
+    fn ids(&self) -> &[u32] {
+        match self {
+            Self::Inline { len, ids } => &ids[..*len as usize],
+            Self::Overflow(ids) => ids.as_slice(),
+        }
+    }
+
+    fn key_string(&self) -> String {
+        let mut key = String::new();
+        for (index, id) in self.ids().iter().enumerate() {
+            if index > 0 {
+                key.push('_');
+            }
+            key.push_str(&id.to_string());
+        }
+        key
+    }
+
+    fn ids_json(&self) -> Value {
+        Value::Array(self.ids().iter().map(|id| json!(id.to_string())).collect())
+    }
+}
+
+#[derive(Default)]
+struct SupportDeckInterner {
+    keys: Vec<SupportDeckKey>,
+    ids: HashMap<SupportDeckKey, u32>,
+}
+
+impl SupportDeckInterner {
+    fn intern(&mut self, key: SupportDeckKey) -> u32 {
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+
+        let id = self.keys.len() as u32;
+        self.keys.push(key.clone());
+        self.ids.insert(key, id);
+        id
+    }
+
+    fn get(&self, id: u32) -> Option<&SupportDeckKey> {
+        self.keys.get(id as usize)
+    }
 }
 
 struct ResourceMonitor {
@@ -262,7 +341,7 @@ struct ReportAgg {
     skill_items: HashMap<u32, ItemLevelCounts>,
     support_count: u64,
     skill_count: u64,
-    combo_counts: HashMap<String, u64>,
+    combo_counts: HashMap<u32, u64>,
     combo_total: u64,
 }
 
@@ -305,9 +384,9 @@ impl ReportAgg {
             entry.levels[*level] += 1;
         }
 
-        if let Some(deck_key) = &prepared.support_deck_key {
+        if let Some(deck_id) = prepared.support_deck_id {
             self.combo_total += 1;
-            *self.combo_counts.entry(deck_key.clone()).or_insert(0) += 1;
+            *self.combo_counts.entry(deck_id).or_insert(0) += 1;
         }
     }
 
@@ -338,22 +417,25 @@ impl ReportAgg {
         item_counter_json(&self.skill_items)
     }
 
-    fn combinations_json(&self) -> Value {
+    fn combinations_json(&self, support_decks: &SupportDeckInterner) -> Value {
         if self.combo_total == 0 {
             return Value::Object(Map::new());
         }
 
-        let mut combos: Vec<(&String, &u64)> = self.combo_counts.iter().collect();
+        let mut combos: Vec<(&u32, &u64)> = self.combo_counts.iter().collect();
         combos.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
 
         let mut result = Map::new();
-        for (combo, count) in combos.into_iter().take(50) {
+        for (deck_id, count) in combos.into_iter().take(50) {
+            let combo = support_decks
+                .get(*deck_id)
+                .expect("support deck id should resolve");
             result.insert(
-                combo.clone(),
+                combo.key_string(),
                 json!({
                     "count": count,
                     "percentage": percentage(*count, self.combo_total),
-                    "support_card_ids": combo_card_ids(combo)
+                    "support_card_ids": combo.ids_json()
                 }),
             );
         }
@@ -415,6 +497,7 @@ struct Compiler {
     characters: HashMap<u32, CharacterAgg>,
     trainer_counts: TrainerCounts,
     active_trainer: Option<ActiveTrainer>,
+    support_decks: SupportDeckInterner,
 }
 
 impl Compiler {
@@ -429,7 +512,7 @@ impl Compiler {
 
     fn add_row(&mut self, row: RowData) {
         self.observe_trainer(&row);
-        let prepared = prepare_row(&row);
+        let prepared = prepare_row(&row, &mut self.support_decks);
 
         self.total_entries += 1;
         self.character_ids.insert(row.card_id);
@@ -896,7 +979,7 @@ impl Compiler {
 
     fn global_combinations_json(&self) -> Value {
         self.global_metric_json(
-            ReportAgg::combinations_json,
+            |report| report.combinations_json(&self.support_decks),
             |report| report.combo_total,
             "total_combinations",
         )
@@ -989,13 +1072,19 @@ impl Compiler {
             }
 
             let mut class_map = Map::new();
-            class_map.insert("overall".to_string(), distance_report_json(report, 20));
+            class_map.insert(
+                "overall".to_string(),
+                distance_report_json(report, 20, &self.support_decks),
+            );
 
             let mut by_scenario = Map::new();
             for scenario in sorted_scenarios_for_team(&distance.by_team_class_scenario, team_class)
             {
                 let report = &distance.by_team_class_scenario[&(team_class, scenario)];
-                by_scenario.insert(scenario.to_string(), distance_report_json(report, 20));
+                by_scenario.insert(
+                    scenario.to_string(),
+                    distance_report_json(report, 20, &self.support_decks),
+                );
             }
             class_map.insert("by_scenario".to_string(), Value::Object(by_scenario));
             by_team_class.insert(team_class.to_string(), Value::Object(class_map));
@@ -1009,7 +1098,10 @@ impl Compiler {
                 continue;
             }
 
-            by_scenario.insert(scenario.to_string(), distance_report_json(report, 20));
+            by_scenario.insert(
+                scenario.to_string(),
+                distance_report_json(report, 20, &self.support_decks),
+            );
         }
         root.insert("by_scenario".to_string(), Value::Object(by_scenario));
 
@@ -1063,14 +1155,14 @@ impl Compiler {
 
         root.insert(
             "overall".to_string(),
-            character_overall_json(&character.overall),
+            character_overall_json(&character.overall, &self.support_decks),
         );
 
         let mut by_scenario = Map::new();
         for scenario in sorted_keys(&character.by_scenario) {
             by_scenario.insert(
                 scenario.to_string(),
-                character_overall_json(&character.by_scenario[&scenario]),
+                character_overall_json(&character.by_scenario[&scenario], &self.support_decks),
             );
         }
         root.insert("by_scenario".to_string(), Value::Object(by_scenario));
@@ -1102,7 +1194,7 @@ impl Compiler {
                 let mut team_map = Map::new();
                 team_map.insert(
                     "overall".to_string(),
-                    character_distance_report_json(report),
+                    character_distance_report_json(report, &self.support_decks),
                 );
 
                 let mut scenario_map = Map::new();
@@ -1120,6 +1212,7 @@ impl Compiler {
                         character_distance_report_json(
                             &character.by_distance_class_scenario
                                 [&(distance_id, team_class, scenario)],
+                            &self.support_decks,
                         ),
                     );
                 }
@@ -1294,7 +1387,7 @@ fn parse_record(headers: &StringRecord, record: &StringRecord) -> Result<RowData
     })
 }
 
-fn prepare_row(row: &RowData) -> PreparedRow {
+fn prepare_row(row: &RowData, support_decks: &mut SupportDeckInterner) -> PreparedRow {
     let support_items = row
         .support_cards
         .iter()
@@ -1306,19 +1399,8 @@ fn prepare_row(row: &RowData) -> PreparedRow {
         .filter_map(|raw| parse_item(*raw))
         .collect::<Vec<_>>();
 
-    let mut deck_ids: Vec<u32> = support_items.iter().map(|(item_id, _)| *item_id).collect();
-    deck_ids.sort_unstable();
-    let support_deck_key = if deck_ids.is_empty() {
-        None
-    } else {
-        Some(
-            deck_ids
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join("_"),
-        )
-    };
+    let support_deck_id =
+        SupportDeckKey::from_items(&support_items).map(|deck_key| support_decks.intern(deck_key));
 
     PreparedRow {
         support_items,
@@ -1329,11 +1411,15 @@ fn prepare_row(row: &RowData) -> PreparedRow {
             .filter(|value| **value != 0)
             .count() as u64,
         skill_count: row.skills.iter().filter(|value| **value != 0).count() as u64,
-        support_deck_key,
+        support_deck_id,
     }
 }
 
-fn distance_report_json(report: &ReportAgg, uma_limit: usize) -> Value {
+fn distance_report_json(
+    report: &ReportAgg,
+    uma_limit: usize,
+    support_decks: &SupportDeckInterner,
+) -> Value {
     json!({
         "total_entries": report.entries,
         "total_trained_umas": report.entries,
@@ -1341,35 +1427,38 @@ fn distance_report_json(report: &ReportAgg, uma_limit: usize) -> Value {
         "stat_averages": report.stats_json(),
         "support_cards": report.support_cards_json(),
         "total_support_cards": report.support_count,
-        "support_card_combinations": report.combinations_json(),
+        "support_card_combinations": report.combinations_json(support_decks),
         "total_combinations": report.combo_total,
         "skills": report.skills_json(),
         "total_skills": report.skill_count
     })
 }
 
-fn character_overall_json(report: &ReportAgg) -> Value {
+fn character_overall_json(report: &ReportAgg, support_decks: &SupportDeckInterner) -> Value {
     json!({
         "total_entries": report.entries,
         "total_trained_umas": report.entries,
         "stat_averages": report.stats_json(),
         "support_cards": report.support_cards_json(),
         "total_support_cards": report.support_count,
-        "support_card_combinations": report.combinations_json(),
+        "support_card_combinations": report.combinations_json(support_decks),
         "total_combinations": report.combo_total,
         "skills": report.skills_json(),
         "total_skills": report.skill_count
     })
 }
 
-fn character_distance_report_json(report: &ReportAgg) -> Value {
+fn character_distance_report_json(
+    report: &ReportAgg,
+    support_decks: &SupportDeckInterner,
+) -> Value {
     json!({
         "total_entries": report.entries,
         "total_trained_umas": report.entries,
         "stat_averages": if report.entries > 20 { report.stats_json() } else { report.partial_stats_json() },
         "common_support_cards": report.support_cards_json(),
         "total_support_cards": report.support_count,
-        "support_card_combinations": report.combinations_json(),
+        "support_card_combinations": report.combinations_json(support_decks),
         "total_combinations": report.combo_total,
         "common_skills": report.skills_json(),
         "total_skills": report.skill_count
@@ -1641,10 +1730,6 @@ fn parse_item(raw: u32) -> Option<(u32, usize)> {
     Some((raw / 10, (raw % 10) as usize))
 }
 
-fn combo_card_ids(combo: &str) -> Value {
-    Value::Array(combo.split('_').map(|id| json!(id)).collect())
-}
-
 fn field<'a>(headers: &StringRecord, record: &'a StringRecord, name: &str) -> Result<&'a str> {
     let index = headers
         .iter()
@@ -1741,4 +1826,28 @@ fn chrono_timestamp() -> String {
         .naive_local()
         .format("%Y-%m-%dT%H:%M:%S%.6f")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_json_and_postgres_u32_arrays() {
+        assert_eq!(
+            parse_u32_array("[100011, \"100024\"]"),
+            vec![100011, 100024]
+        );
+        assert_eq!(
+            parse_u32_array("{100011,100024,NULL}"),
+            vec![100011, 100024]
+        );
+        assert_eq!(parse_u32_array("{}"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn unpacks_item_id_and_appended_level() {
+        assert_eq!(parse_item(100024), Some((10002, 4)));
+        assert_eq!(parse_item(0), None);
+    }
 }
