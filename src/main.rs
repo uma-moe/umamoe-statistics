@@ -1289,8 +1289,8 @@ fn parse_record(headers: &StringRecord, record: &StringRecord) -> Result<RowData
             parse_required(headers, record, "guts")?,
             parse_required(headers, record, "rank_score")?,
         ],
-        skills: parse_json_u32_array(field(headers, record, "skills")?),
-        support_cards: parse_json_u32_array(field(headers, record, "support_cards")?),
+        skills: parse_u32_array(field(headers, record, "skills")?),
+        support_cards: parse_u32_array(field(headers, record, "support_cards")?),
     })
 }
 
@@ -1598,18 +1598,40 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))
 }
 
-fn parse_json_u32_array(input: &str) -> Vec<u32> {
-    let Ok(value) = serde_json::from_str::<Value>(input) else {
+fn parse_u32_array(input: &str) -> Vec<u32> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
         return Vec::new();
-    };
-    let Some(array) = value.as_array() else {
-        return Vec::new();
-    };
+    }
 
-    array
-        .iter()
-        .filter_map(|value| json_u32(Some(value)))
-        .collect()
+    if trimmed.starts_with('[') {
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            return Vec::new();
+        };
+        let Some(array) = value.as_array() else {
+            return Vec::new();
+        };
+        return array
+            .iter()
+            .filter_map(|value| json_u32(Some(value)))
+            .collect();
+    }
+
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return trimmed[1..trimmed.len() - 1]
+            .split(',')
+            .filter_map(|value| {
+                let value = value.trim().trim_matches('"');
+                if value.is_empty() || value.eq_ignore_ascii_case("null") {
+                    None
+                } else {
+                    value.parse::<u32>().ok()
+                }
+            })
+            .collect();
+    }
+
+    Vec::new()
 }
 
 fn parse_item(raw: u32) -> Option<(u32, usize)> {
