@@ -2,13 +2,16 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Local;
 use clap::Parser;
 use csv::StringRecord;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use postgres::{Client, NoTls};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::Hash;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -18,8 +21,10 @@ use sysinfo::{get_current_pid, Pid, System};
 const STAT_NAMES: [&str; 6] = ["speed", "power", "stamina", "wiz", "guts", "rank_score"];
 const DISTANCE_IDS: [u8; 5] = [1, 2, 3, 4, 5];
 const DATA_FORMAT: &str = "ids-v1";
-const DATA_FORMAT_VERSION: u8 = 3;
+const DATA_FORMAT_VERSION: u8 = 4;
 const INLINE_SUPPORT_DECK_SIZE: usize = 6;
+const FRIEND_SUPPORT_CARD_TYPE: u32 = 5;
+const GROUP_SUPPORT_CARD_TYPE: u32 = 6;
 const UNKNOWN_SUPPORT_CARD_TYPE: u32 = 99;
 const SUPPORT_CARDS_JSON: &str = include_str!("cards.json");
 
@@ -119,19 +124,55 @@ impl SupportDeckKey {
         }
     }
 
-    fn key_string(&self) -> String {
-        let mut key = String::new();
-        for (index, id) in self.ids().iter().enumerate() {
-            if index > 0 {
-                key.push('_');
+    fn composition(&self) -> Vec<(&'static str, u32)> {
+        let mut counts: Vec<(&'static str, u32)> = Vec::new();
+        for type_id in self.ids() {
+            let name = support_card_type_name(*type_id);
+            if let Some((_, count)) = counts.iter_mut().find(|(existing, _)| *existing == name) {
+                *count += 1;
+            } else {
+                counts.push((name, 1));
             }
-            key.push_str(&id.to_string());
         }
-        key
+        counts
     }
 
-    fn ids_json(&self) -> Value {
-        Value::Array(self.ids().iter().map(|id| json!(id.to_string())).collect())
+    fn composition_key(&self) -> String {
+        self.composition()
+            .into_iter()
+            .map(|(name, count)| format!("{count}x{name}"))
+            .collect::<Vec<_>>()
+            .join("_")
+    }
+
+    fn composition_json(&self) -> Value {
+        let mut composition = Map::new();
+        for (name, count) in self.composition() {
+            composition.insert(name.to_string(), json!(count));
+        }
+        Value::Object(composition)
+    }
+}
+
+fn support_card_type_name(type_id: u32) -> &'static str {
+    match type_id {
+        0 => "speed",
+        1 => "stamina",
+        2 => "power",
+        3 => "guts",
+        4 => "wisdom",
+        FRIEND_SUPPORT_CARD_TYPE => "friend",
+        GROUP_SUPPORT_CARD_TYPE => "group",
+        UNKNOWN_SUPPORT_CARD_TYPE => "unknown",
+        _ => "unknown",
+    }
+}
+
+fn normalize_support_card_type(raw_type: u32, is_group: bool) -> u32 {
+    match raw_type {
+        GROUP_SUPPORT_CARD_TYPE if is_group => GROUP_SUPPORT_CARD_TYPE,
+        GROUP_SUPPORT_CARD_TYPE => FRIEND_SUPPORT_CARD_TYPE,
+        other => other,
     }
 }
 
@@ -503,11 +544,11 @@ impl ReportAgg {
                 .get(*deck_id)
                 .expect("support deck id should resolve");
             result.insert(
-                combo.key_string(),
+                combo.composition_key(),
                 json!({
                     "count": count,
                     "percentage": percentage(*count, self.combo_total),
-                    "support_card_type_ids": combo.ids_json()
+                    "composition": combo.composition_json()
                 }),
             );
         }
@@ -857,25 +898,12 @@ impl Compiler {
 
         remove_path(&staging_root)?;
         fs::create_dir_all(staging_root.join("global"))?;
-        fs::create_dir_all(staging_root.join("distance"))?;
         fs::create_dir_all(staging_root.join("characters"))?;
 
-        write_json_pretty(
+        write_json(
             &staging_root.join("global/global.json"),
             &self.global_json(),
         )?;
-
-        for distance_id in DISTANCE_IDS {
-            if let Some(distance) = self.distances.get(&distance_id) {
-                if distance.total_entries > 0 {
-                    let filename = format!("{distance_id}.json");
-                    write_json_pretty(
-                        &staging_root.join("distance").join(filename),
-                        &self.distance_json(distance_id, distance),
-                    )?;
-                }
-            }
-        }
 
         let mut character_ids: Vec<u32> = self.characters.keys().copied().collect();
         character_ids.sort_unstable();
@@ -884,7 +912,7 @@ impl Compiler {
                 .characters
                 .get(&character_id)
                 .expect("character key exists");
-            write_json_pretty(
+            write_json(
                 &staging_root
                     .join("characters")
                     .join(format!("{character_id}.json")),
@@ -893,7 +921,7 @@ impl Compiler {
         }
 
         let index = self.index_json();
-        write_json_pretty(&staging_root.join("index.json"), &index)?;
+        write_json_plain(&staging_root.join("index.json"), &index)?;
         replace_directory(&staging_root, &dataset_root, &backup_root)?;
         update_master_index(
             output_root,
@@ -963,7 +991,25 @@ impl Compiler {
             self.global_combinations_json(),
         );
         root.insert("skills".to_string(), self.global_skills_json());
+        root.insert("by_distance".to_string(), self.global_distances_json());
         Value::Object(root)
+    }
+
+    fn global_distances_json(&self) -> Value {
+        let mut by_distance = Map::new();
+        for distance_id in DISTANCE_IDS {
+            let Some(distance) = self.distances.get(&distance_id) else {
+                continue;
+            };
+            if distance.total_entries == 0 {
+                continue;
+            }
+            by_distance.insert(
+                distance_id.to_string(),
+                self.distance_json(distance_id, distance),
+            );
+        }
+        Value::Object(by_distance)
     }
 
     fn global_team_class_distribution_json(&self) -> Value {
@@ -1938,7 +1984,7 @@ fn update_master_index(
     index: Value,
 ) -> Result<()> {
     let path = output_root.join("datasets.json");
-    let mut master = if path.exists() {
+    let mut master = if json_storage_exists(&path) {
         read_json(&path)?
     } else {
         json!({"datasets": [], "last_updated": generated_at})
@@ -1968,15 +2014,55 @@ fn update_master_index(
         right_date.cmp(left_date)
     });
     master["last_updated"] = json!(generated_at);
-    write_json_pretty(&path, &master)
+    write_json_plain(&path, &master)
 }
 
-fn write_json_pretty(path: &Path, value: &Value) -> Result<()> {
+fn write_json_plain(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+    let bytes = serde_json::to_vec(value)?;
+    fs::write(path, &bytes).with_context(|| format!("write {}", path.display()))?;
+
+    let gz_path = gzip_path(path);
+    if gz_path.exists() {
+        fs::remove_file(&gz_path).with_context(|| format!("remove {}", gz_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn write_json(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(value)?;
+    let gz_path = gzip_path(path);
+    let gz_bytes = gzip_bytes(&bytes)?;
+    fs::write(&gz_path, gz_bytes).with_context(|| format!("write {}", gz_path.display()))?;
+
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn gzip_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => path.with_extension(format!("{extension}.gz")),
+        None => path.with_extension("gz"),
+    }
+}
+
+fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(bytes)?;
+    encoder.finish().map_err(Into::into)
+}
+
+fn json_storage_exists(path: &Path) -> bool {
+    path.exists() || gzip_path(path).exists()
 }
 
 fn resolve_from(base: &Path, path: PathBuf) -> PathBuf {
@@ -2031,8 +2117,21 @@ fn remove_path(path: &Path) -> Result<()> {
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))
+    if path.exists() {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        return serde_json::from_str(&content)
+            .with_context(|| format!("parse {}", path.display()));
+    }
+
+    let gz_path = gzip_path(path);
+    let compressed = fs::read(&gz_path).with_context(|| format!("read {}", gz_path.display()))?;
+    let mut decoder = GzDecoder::new(compressed.as_slice());
+    let mut content = String::new();
+    decoder
+        .read_to_string(&mut content)
+        .with_context(|| format!("decompress {}", gz_path.display()))?;
+    serde_json::from_str(&content).with_context(|| format!("parse {}", gz_path.display()))
 }
 
 fn parse_u32_array(input: &str) -> Vec<u32> {
@@ -2101,8 +2200,11 @@ fn load_support_card_types() -> Result<SupportCardTypes> {
     for card in cards {
         let card_id = json_u32(card.get("id"))
             .ok_or_else(|| anyhow!("card entry missing numeric id in src/cards.json"))?;
-        let card_type = json_u32(card.get("type"))
+        let raw_type = json_u32(card.get("type"))
             .ok_or_else(|| anyhow!("card {card_id} missing numeric type in src/cards.json"))?;
+        let is_group = json_bool(card.get("group"))
+            .ok_or_else(|| anyhow!("card {card_id} missing boolean group in src/cards.json"))?;
+        let card_type = normalize_support_card_type(raw_type, is_group);
 
         if let Some(existing_type) = by_card_id.insert(card_id, card_type) {
             if existing_type != card_type {
@@ -2156,6 +2258,18 @@ fn json_u32(value: Option<&Value>) -> Option<u32> {
     match value? {
         Value::Number(number) => number.as_u64().and_then(|value| u32::try_from(value).ok()),
         Value::String(text) => text.parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+fn json_bool(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(boolean) => Some(*boolean),
+        Value::String(text) => match text.as_str() {
+            "true" | "TRUE" | "True" => Some(true),
+            "false" | "FALSE" | "False" => Some(false),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2304,7 +2418,11 @@ mod tests {
     fn loads_support_card_types_from_cards_json() {
         let support_card_types = load_support_card_types().unwrap();
         assert_eq!(support_card_types.card_type(10001), 3);
-        assert_eq!(support_card_types.card_type(20021), 6);
+        assert_eq!(
+            support_card_types.card_type(10021),
+            FRIEND_SUPPORT_CARD_TYPE
+        );
+        assert_eq!(support_card_types.card_type(30067), GROUP_SUPPORT_CARD_TYPE);
         assert_eq!(
             support_card_types.card_type(999_999),
             UNKNOWN_SUPPORT_CARD_TYPE
@@ -2323,7 +2441,7 @@ mod tests {
             team_class: Some(1),
             stats: [0; 6],
             skills: Vec::new(),
-            support_cards: vec![100014, 200214],
+            support_cards: vec![100214, 300674],
         };
         let mut support_decks = SupportDeckInterner::default();
         let prepared = prepare_row(&row, &mut support_decks, &support_card_types);
@@ -2331,7 +2449,15 @@ mod tests {
             .get(prepared.support_deck_id.unwrap())
             .unwrap();
 
-        assert_eq!(deck.key_string(), "3_6");
-        assert_eq!(deck.ids_json(), json!(["3", "6"]));
+        assert_eq!(deck.composition_key(), "1xfriend_1xgroup");
+        assert_eq!(deck.composition_json(), json!({"friend": 1, "group": 1}));
+    }
+
+    #[test]
+    fn support_deck_key_serializes_type_composition() {
+        let deck = SupportDeckKey::from_ids(&[0, 0, 0, 0, 1, 1]).unwrap();
+
+        assert_eq!(deck.composition_key(), "4xspeed_2xstamina");
+        assert_eq!(deck.composition_json(), json!({"speed": 4, "stamina": 2}));
     }
 }

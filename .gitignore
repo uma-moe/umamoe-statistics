@@ -1,3 +1,4 @@
 /target/
 /statistics/
 .env
+Cargo.lock
