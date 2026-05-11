@@ -18,8 +18,10 @@ use sysinfo::{get_current_pid, Pid, System};
 const STAT_NAMES: [&str; 6] = ["speed", "power", "stamina", "wiz", "guts", "rank_score"];
 const DISTANCE_IDS: [u8; 5] = [1, 2, 3, 4, 5];
 const DATA_FORMAT: &str = "ids-v1";
-const DATA_FORMAT_VERSION: u8 = 2;
+const DATA_FORMAT_VERSION: u8 = 3;
 const INLINE_SUPPORT_DECK_SIZE: usize = 6;
+const UNKNOWN_SUPPORT_CARD_TYPE: u32 = 99;
+const SUPPORT_CARDS_JSON: &str = include_str!("cards.json");
 
 #[derive(Parser, Debug)]
 #[command(
@@ -88,23 +90,23 @@ enum SupportDeckKey {
 }
 
 impl SupportDeckKey {
-    fn from_items(items: &[(u32, usize)]) -> Option<Self> {
-        if items.is_empty() {
+    fn from_ids(type_ids: &[u32]) -> Option<Self> {
+        if type_ids.is_empty() {
             return None;
         }
 
-        if items.len() <= INLINE_SUPPORT_DECK_SIZE {
+        if type_ids.len() <= INLINE_SUPPORT_DECK_SIZE {
             let mut ids = [0_u32; INLINE_SUPPORT_DECK_SIZE];
-            for (index, (item_id, _)) in items.iter().enumerate() {
-                ids[index] = *item_id;
+            for (index, type_id) in type_ids.iter().enumerate() {
+                ids[index] = *type_id;
             }
-            ids[..items.len()].sort_unstable();
+            ids[..type_ids.len()].sort_unstable();
             Some(Self::Inline {
-                len: items.len() as u8,
+                len: type_ids.len() as u8,
                 ids,
             })
         } else {
-            let mut deck_ids: Vec<u32> = items.iter().map(|(item_id, _)| *item_id).collect();
+            let mut deck_ids = type_ids.to_vec();
             deck_ids.sort_unstable();
             Some(Self::Overflow(deck_ids))
         }
@@ -130,6 +132,23 @@ impl SupportDeckKey {
 
     fn ids_json(&self) -> Value {
         Value::Array(self.ids().iter().map(|id| json!(id.to_string())).collect())
+    }
+}
+
+struct SupportCardTypes {
+    by_card_id: HashMap<u32, u32>,
+}
+
+impl SupportCardTypes {
+    fn card_type(&self, card_id: u32) -> u32 {
+        self.by_card_id
+            .get(&card_id)
+            .copied()
+            .unwrap_or(UNKNOWN_SUPPORT_CARD_TYPE)
+    }
+
+    fn len(&self) -> usize {
+        self.by_card_id.len()
     }
 }
 
@@ -488,7 +507,7 @@ impl ReportAgg {
                 json!({
                     "count": count,
                     "percentage": percentage(*count, self.combo_total),
-                    "support_card_ids": combo.ids_json()
+                    "support_card_type_ids": combo.ids_json()
                 }),
             );
         }
@@ -657,9 +676,9 @@ impl Compiler {
             .collect()
     }
 
-    fn add_row(&mut self, row: RowData) {
+    fn add_row(&mut self, row: RowData, support_card_types: &SupportCardTypes) {
         self.observe_trainer(&row);
-        let prepared = prepare_row(&row, &mut self.support_decks);
+        let prepared = prepare_row(&row, &mut self.support_decks, support_card_types);
 
         self.total_entries += 1;
         self.character_ids.insert(row.card_id);
@@ -1391,6 +1410,7 @@ fn main() -> Result<()> {
         .max(1);
     let batch_rows = args.batch_rows.max(1);
     let progress_every = args.progress_every;
+    let support_card_types = Arc::new(load_support_card_types()?);
     let repo_root = args.repo_root.canonicalize().unwrap_or(args.repo_root);
     let database_url = args
         .database_url
@@ -1408,6 +1428,10 @@ fn main() -> Result<()> {
             .map(|path| resolve_from(&repo_root, path))
             .collect::<Vec<_>>()
     };
+    println!(
+        "Loaded {} support-card type mappings from cards.json...",
+        support_card_types.len()
+    );
     println!("Connecting to PostgreSQL...");
     let mut client = Client::connect(&database_url, NoTls).context("connect to PostgreSQL")?;
 
@@ -1432,6 +1456,7 @@ fn main() -> Result<()> {
             worker_threads,
             batch_rows,
             progress_every,
+            Arc::clone(&support_card_types),
             &mut resource_monitor,
             started_at,
         )?;
@@ -1441,6 +1466,7 @@ fn main() -> Result<()> {
             &headers,
             &mut compiler,
             progress_every,
+            support_card_types.as_ref(),
             &mut resource_monitor,
             started_at,
         )?;
@@ -1489,13 +1515,14 @@ fn stream_rows_serial<R: Read>(
     headers: &StringRecord,
     compiler: &mut Compiler,
     progress_every: u64,
+    support_card_types: &SupportCardTypes,
     resource_monitor: &mut Option<ResourceMonitor>,
     started_at: Instant,
 ) -> Result<()> {
     for result in csv_reader.records() {
         let record = result.context("read COPY row")?;
         let row = parse_record(headers, &record)?;
-        compiler.add_row(row);
+        compiler.add_row(row, support_card_types);
 
         if progress_every > 0 && compiler.total_entries % progress_every == 0 {
             print_progress(
@@ -1518,6 +1545,7 @@ fn stream_rows_parallel<R: Read>(
     worker_threads: usize,
     batch_rows: usize,
     progress_every: u64,
+    support_card_types: Arc<SupportCardTypes>,
     resource_monitor: &mut Option<ResourceMonitor>,
     started_at: Instant,
 ) -> Result<()> {
@@ -1530,6 +1558,7 @@ fn stream_rows_parallel<R: Read>(
         let batch_receiver = Arc::clone(&batch_receiver);
         let result_sender = result_sender.clone();
         let dataset_version = dataset_version.to_string();
+        let support_card_types = Arc::clone(&support_card_types);
         handles.push(thread::spawn(move || loop {
             let batch = {
                 let receiver = batch_receiver.lock().expect("batch receiver lock poisoned");
@@ -1542,7 +1571,7 @@ fn stream_rows_parallel<R: Read>(
 
             let mut partial = Compiler::new(dataset_version.clone());
             for row in batch {
-                partial.add_row(row);
+                partial.add_row(row, support_card_types.as_ref());
             }
             partial.finish();
 
@@ -1696,11 +1725,21 @@ fn parse_record(headers: &StringRecord, record: &StringRecord) -> Result<RowData
     })
 }
 
-fn prepare_row(row: &RowData, support_decks: &mut SupportDeckInterner) -> PreparedRow {
+fn prepare_row(
+    row: &RowData,
+    support_decks: &mut SupportDeckInterner,
+    support_card_types: &SupportCardTypes,
+) -> PreparedRow {
+    let mut support_type_ids = Vec::with_capacity(row.support_cards.len());
     let support_items = row
         .support_cards
         .iter()
-        .filter_map(|raw| parse_support_card(*raw).map(|card_id| (card_id, 0)))
+        .filter_map(|raw| {
+            parse_support_card(*raw).map(|card_id| {
+                support_type_ids.push(support_card_types.card_type(card_id));
+                (card_id, 0)
+            })
+        })
         .collect::<Vec<_>>();
     let skill_items = row
         .skills
@@ -1709,7 +1748,7 @@ fn prepare_row(row: &RowData, support_decks: &mut SupportDeckInterner) -> Prepar
         .collect::<Vec<_>>();
 
     let support_deck_id =
-        SupportDeckKey::from_items(&support_items).map(|deck_key| support_decks.intern(deck_key));
+        SupportDeckKey::from_ids(&support_type_ids).map(|deck_key| support_decks.intern(deck_key));
 
     PreparedRow {
         support_items,
@@ -2051,6 +2090,32 @@ fn parse_support_card(raw: u32) -> Option<u32> {
     }
 }
 
+fn load_support_card_types() -> Result<SupportCardTypes> {
+    let value =
+        serde_json::from_str::<Value>(SUPPORT_CARDS_JSON).context("parse src/cards.json")?;
+    let cards = value
+        .as_array()
+        .ok_or_else(|| anyhow!("src/cards.json must contain an array"))?;
+    let mut by_card_id = HashMap::new();
+
+    for card in cards {
+        let card_id = json_u32(card.get("id"))
+            .ok_or_else(|| anyhow!("card entry missing numeric id in src/cards.json"))?;
+        let card_type = json_u32(card.get("type"))
+            .ok_or_else(|| anyhow!("card {card_id} missing numeric type in src/cards.json"))?;
+
+        if let Some(existing_type) = by_card_id.insert(card_id, card_type) {
+            if existing_type != card_type {
+                return Err(anyhow!(
+                    "card {card_id} has conflicting types {existing_type} and {card_type} in src/cards.json"
+                ));
+            }
+        }
+    }
+
+    Ok(SupportCardTypes { by_card_id })
+}
+
 fn field<'a>(headers: &StringRecord, record: &'a StringRecord, name: &str) -> Result<&'a str> {
     let index = headers
         .iter()
@@ -2233,5 +2298,40 @@ mod tests {
         assert_eq!(parse_support_card(100014), Some(10001));
         assert_eq!(parse_support_card(1000142), Some(10001));
         assert_eq!(parse_support_card(0), None);
+    }
+
+    #[test]
+    fn loads_support_card_types_from_cards_json() {
+        let support_card_types = load_support_card_types().unwrap();
+        assert_eq!(support_card_types.card_type(10001), 3);
+        assert_eq!(support_card_types.card_type(20021), 6);
+        assert_eq!(
+            support_card_types.card_type(999_999),
+            UNKNOWN_SUPPORT_CARD_TYPE
+        );
+    }
+
+    #[test]
+    fn support_deck_key_uses_type_ids() {
+        let support_card_types = load_support_card_types().unwrap();
+        let row = RowData {
+            trainer_id: "trainer".to_string(),
+            card_id: 100101,
+            distance_type: 1,
+            scenario_id: 1,
+            running_style: 1,
+            team_class: Some(1),
+            stats: [0; 6],
+            skills: Vec::new(),
+            support_cards: vec![100014, 200214],
+        };
+        let mut support_decks = SupportDeckInterner::default();
+        let prepared = prepare_row(&row, &mut support_decks, &support_card_types);
+        let deck = support_decks
+            .get(prepared.support_deck_id.unwrap())
+            .unwrap();
+
+        assert_eq!(deck.key_string(), "3_6");
+        assert_eq!(deck.ids_json(), json!(["3", "6"]));
     }
 }
