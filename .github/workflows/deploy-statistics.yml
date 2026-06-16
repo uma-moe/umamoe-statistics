@@ -1,9 +1,6 @@
 name: Build And Deploy Statistics
 
 on:
-  schedule:
-    # Sunday 00:00 JST. GitHub Actions cron uses UTC.
-    - cron: '0 15 * * 6'
   push:
     branches:
       - main
@@ -24,12 +21,12 @@ on:
           - production
           - both
       dataset_version:
-        description: Optional dataset id, for example 2026-W19. Empty uses the generator default.
+        description: Optional dataset id for the immediate run, for example 2026-W19. Empty uses the generator default.
         required: false
         default: ''
         type: string
       limit:
-        description: Optional row limit for smoke runs. Leave empty for the full dataset.
+        description: Optional row limit for an immediate smoke run. Leave empty for the full dataset.
         required: false
         default: ''
         type: string
@@ -44,7 +41,7 @@ on:
         default: '100000'
         type: string
       run_statistics_now:
-        description: Run the statistics export immediately after deploying the Docker image.
+        description: Run a statistics export immediately after starting the scheduler container.
         required: true
         default: true
         type: boolean
@@ -96,7 +93,7 @@ jobs:
           limit="${{ github.event.inputs.limit || '' }}"
           worker_threads="${{ github.event.inputs.worker_threads || '3' }}"
           batch_rows="${{ github.event.inputs.batch_rows || '100000' }}"
-          run_statistics_now="${{ github.event.inputs.run_statistics_now || 'true' }}"
+          run_statistics_now="${{ github.event.inputs.run_statistics_now || 'false' }}"
 
           validate_positive_int() {
             local name="$1"
@@ -266,7 +263,8 @@ jobs:
           limit="${LIMIT:-}"
           worker_threads="${WORKER_THREADS:-3}"
           batch_rows="${BATCH_ROWS:-100000}"
-          run_statistics_now="${RUN_STATISTICS_NOW:-true}"
+          run_statistics_now="${RUN_STATISTICS_NOW:-false}"
+          container_name="umamoe-statistics-${deploy_target}"
           env_file="$ENV_FILE"
           prod_frontend_root="$PROD_FRONTEND_ROOT"
           beta_frontend_root="$BETA_FRONTEND_ROOT"
@@ -290,27 +288,23 @@ jobs:
 
           gzip -dc "$archive" | docker load
 
-          case "$run_statistics_now" in
-            1|true|TRUE|yes|YES)
-              ;;
-            *)
-              echo "Docker image loaded. Skipping immediate statistics run because run_statistics_now=$run_statistics_now."
-              rm -f "$archive"
-              docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
-              exit 0
-              ;;
-          esac
-
           if [ ! -f "$env_file" ]; then
             echo "Missing statistics env file: $env_file" >&2
             exit 1
           fi
 
           docker_args=(
-            run --rm
-            --name "umamoe-statistics-${deploy_target}"
+            run -d
+            --restart unless-stopped
+            --name "$container_name"
             --add-host host.docker.internal:host-gateway
             --env-file "$env_file"
+            -e "UMAMOE_RUN_MODE=scheduled"
+            -e "UMAMOE_RUN_ON_START=$run_statistics_now"
+            -e "UMAMOE_SCHEDULE_TZ=Asia/Tokyo"
+            -e "UMAMOE_SCHEDULE_DAY=6"
+            -e "UMAMOE_SCHEDULE_HOUR=0"
+            -e "UMAMOE_SCHEDULE_MINUTE=0"
             -e "UMAMOE_TARGET_ROOTS=$target_roots"
             -e "UMAMOE_STATISTICS_RELATIVE_DIR=$statistics_relative_dir"
             -e "UMAMOE_WORKER_THREADS=$worker_threads"
@@ -318,11 +312,11 @@ jobs:
           )
 
           if [ -n "$dataset_version" ]; then
-            docker_args+=(-e "UMAMOE_DATASET_VERSION=$dataset_version")
+            docker_args+=(-e "UMAMOE_RUN_ON_START_DATASET_VERSION=$dataset_version")
           fi
 
           if [ -n "$limit" ]; then
-            docker_args+=(-e "UMAMOE_LIMIT=$limit")
+            docker_args+=(-e "UMAMOE_RUN_ON_START_LIMIT=$limit")
           fi
 
           for target_root in $target_roots; do
@@ -330,8 +324,17 @@ jobs:
             docker_args+=(-v "$target_root:$target_root")
           done
 
-          docker rm -f "umamoe-statistics-${deploy_target}" >/dev/null 2>&1 || true
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
           docker "${docker_args[@]}" "$image_tag"
+          sleep 3
+
+          if [ "$(docker inspect -f '{{.State.Running}}' "$container_name")" != "true" ]; then
+            echo "Statistics scheduler container exited after startup." >&2
+            docker logs "$container_name" >&2 || true
+            exit 1
+          fi
+
+          docker logs --tail 25 "$container_name" || true
 
           rm -f "$archive"
           docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true

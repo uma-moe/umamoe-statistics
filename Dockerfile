@@ -8,8 +8,9 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/umamoe-statistics-generator /usr/local/bin/umamoe-statistics-generator
