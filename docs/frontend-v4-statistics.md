@@ -43,6 +43,14 @@ assets/statistics/
 
 Most report blocks use the same core shape: `total_entries`, `stat_averages`, `support_cards`, `support_card_combinations`, `skills`, and matching total counters.
 
+## Population and histogram ranges
+
+New exports include only stadium rows whose trainer has `team_evaluation_point > 2500`. All totals, percentages, and scenario, team-class, distance, and character breakdowns use that filtered population. Existing dataset files are unchanged until regenerated.
+
+Each full stat report contains a 20-bucket `histogram` mapping `start-end` labels to counts. The usual ranges remain 0–1200 for stats and 0–17,000 for rank scores, but expand to cover observed values outside them. The upper bound rounds up to a multiple of the bucket width; for example, a maximum stat of 2001 produces 20 buckets of width 101 ending at 2020. Buckets include the lower bound and exclude the upper bound, except the final bucket includes both.
+
+Read and numerically sort the supplied range labels when rendering charts. Different stats and report groups may have different ranges; do not assume a scenario-specific cap or align buckets by position. Histogram counts sum to the stat report's `count`.
+
 ## How To Read v4
 
 Use this loading order:

@@ -15,6 +15,38 @@ statistics/
 
 Generated datasets use the ID-only format marked by `format: "ids-v1"` and `format_version: 4` in `datasets.json`, each dataset `index.json`, and per-file metadata. Older datasets without this marker are legacy name-resolved statistics.
 
+Only trainers with `team_evaluation_point > 2500` contribute to new exports. Trainers at or below 2500, trainers with a null evaluation, and stadium rows without a matching trainer are excluded before applying `--limit`. This filter applies to every count and breakdown; it does not delete database records or change previously exported datasets.
+
+Stat histograms keep 20 buckets and expand to cover the observed values for each report, including stats above 1200 and rank scores above 17,000. Reports within the original ranges keep their existing bucket boundaries. Consumers should read the supplied range labels instead of assuming a fixed maximum.
+
+## Source layout
+
+The project stays a single Cargo package. `src/main.rs` only declares modules and starts the CLI.
+
+- `src/cli.rs`: arguments, database connection, and export orchestration.
+- `src/statistics/`: aggregation, support-card mapping, CSV streaming, reports, and dataset publication.
+- `src/storage.rs`: JSON/gzip storage and directory replacement.
+- `src/resources.rs`: resource monitoring and progress logging.
+- `src/types/`: declarations grouped by domain, included by their owning modules to preserve private field visibility.
+
+Owned functions use lowerCamelCase; CLI flags and JSON field names retain their existing spelling.
+
+## Verification
+
+```powershell
+cargo fmt --check
+rustfmt --check --edition 2021 src/types/cli.rs src/types/resources.rs src/types/statistics.rs
+cargo test --locked
+cargo build --release --locked
+```
+
+The PostgreSQL cutoff test uses temporary tables and requires an explicitly configured test database:
+
+```powershell
+$env:STATISTICS_TEST_DATABASE_URL = "postgresql://user:password@127.0.0.1:5432/statistics_test"
+cargo test --locked copyQueryExcludesIneligibleTrainersBeforeLimiting -- --ignored
+```
+
 ## Run
 
 From the repository root:
